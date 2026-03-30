@@ -1,0 +1,322 @@
+import numpy as np
+import cv2 as cv
+
+
+def compute_gradients(frame1, frame2):
+    """
+    Compute Ix, Iy, It for the LK equation.
+    frame1, frame2: grayscale images as float32 numpy arrays
+    """
+    """Convert to float so subtraction doesn't overflow
+    standard images are loaded in unit8 which allows only the values from 0-255 ,
+      therefore if we get any any negative of decimal values it will be stored as garbage values
+    eg if we subtract a bright pixel(say 200) from a dark pixel(say 50)
+      ans wont be -150 it will be stored as a garbage value may be 109"""
+
+    
+    
+    f1 = frame1.astype(np.float32)
+    f2 = frame2.astype(np.float32)
+
+    # I_x: Difference in x-direction, averaged over y and t
+    # (Right - Left) for both frames and both rows
+    Ix = 0.25 * (
+        (f1[1:, 1:] - f1[1:, :-1]) + (f1[:-1, 1:] - f1[:-1, :-1]) +
+        (f2[1:, 1:] - f2[1:, :-1]) + (f2[:-1, 1:] - f2[:-1, :-1])
+    )
+
+    # I_y: Difference in y-direction, averaged over x and t
+    # (Bottom - Top) for both frames and both columns
+    Iy = 0.25 * (
+        (f1[1:, 1:] - f1[:-1, 1:]) + (f1[1:, :-1] - f1[:-1, :-1]) +
+        (f2[1:, 1:] - f2[:-1, 1:]) + (f2[1:, :-1] - f2[:-1, :-1])
+    )
+
+    # I_t: Difference in t-direction, averaged over x and y
+    # (Frame2 - Frame1) for all four pixels in the 2x2 square
+    It = 0.25 * (
+        (f2[1:, 1:] - f1[1:, 1:]) + (f2[1:, :-1] - f1[1:, :-1]) +
+        (f2[:-1, 1:] - f1[:-1, 1:]) + (f2[:-1, :-1] - f1[:-1, :-1])
+    )
+
+    return Ix, Iy, It
+
+
+def lk_optical_flow_point(Ix, Iy, It, point, win_size=15):
+    """
+    Compute optical flow (u, v) for a single point using LK.
+
+    Ix, Iy, It : gradient arrays
+    point      : (x, y) location to track
+    win_size   : patch size (15 means 15x15 window)
+    """
+    x, y = int(point[0]), int(point[1])
+    half = win_size // 2  # = 7 for win_size=15
+
+    # Extract the patch around the point from gradient arrays
+    # We crop Ix, Iy carefully to account for the 2-column/row size difference
+    x_start = max(x - half, 1)
+    x_end = min(x + half, Ix.shape[1] - 1)
+    y_start = max(y - half, 1)
+    y_end = min(y + half, Ix.shape[0] - 1)
+
+    # Extract patches
+    Ix_patch = Ix[y_start:y_end, x_start:x_end]
+    Iy_patch = Iy[y_start:y_end, x_start:x_end]
+    It_patch = It[y_start+1:y_end+1, x_start+1:x_end+1]  # align It to Ix,Iy
+
+    # Build the 2x2 matrix A^T A
+    Sxx = np.sum(Ix_patch * Ix_patch)
+    Syy = np.sum(Iy_patch * Iy_patch)
+    Sxy = np.sum(Ix_patch * Iy_patch)
+
+    ATA = np.array([[Sxx, Sxy],
+                    [Sxy, Syy]], dtype=np.float32)
+
+    # Build A^T b
+    Sxt = np.sum(Ix_patch * It_patch)
+    Syt = np.sum(Iy_patch * It_patch)
+
+    ATb = np.array([[-Sxt],
+                    [-Syt]], dtype=np.float32)
+
+    # Check if ATA is invertible (determinant not too small)
+    det = ATA[0, 0]*ATA[1, 1] - ATA[0, 1]*ATA[1, 0]
+    if abs(det) < 1e-5:
+        return 0.0, 0.0  # can't solve — return zero flow
+
+    # Solve: [u, v] = (ATA)^-1 * ATb
+    flow = np.linalg.solve(ATA, ATb)
+    u = flow[0, 0]
+    v = flow[1, 0]
+
+    return u, v
+
+
+def track_points(frame1, frame2, points, win_size=15):
+    """
+    Track all points from frame1 to frame2 using LK.
+
+    frame1, frame2 : grayscale images
+    points         : array of shape (N, 1, 2) — points to track
+    win_size       : patch size
+
+    Returns:
+    new_points : array of shape (N, 1, 2) — new positions
+    status     : array of shape (N,) — 1 if tracked, 0 if lost
+    """
+    # Step 1 — compute gradients for this frame pair
+    Ix, Iy, It = compute_gradients(frame1, frame2)
+
+    new_points = []
+    status = []
+
+    # Step 2 — solve LK for every point
+    for point in points:
+        x, y = point[0][0], point[0][1]
+
+        # Step 3 — check if point is too close to border
+        if (x < 8 or x > frame1.shape[1] - 8 or
+                y < 8 or y > frame1.shape[0] - 8):
+            new_points.append([[x, y]])
+            status.append(0)  # mark as lost
+            continue
+
+        # Step 4 — compute flow for this point
+        u, v = lk_optical_flow_point(Ix, Iy, It, (x, y), win_size)
+
+        # Step 5 — check if flow is unreasonably large (lost point)
+        if abs(u) > 50 or abs(v) > 50:
+            new_points.append([[x, y]])
+            status.append(0)  # mark as lost
+            continue
+
+        # Step 6 — new position = old position + flow
+        new_x = x + u
+        new_y = y + v
+        new_points.append([[new_x, new_y]])
+        status.append(1)  # successfully tracked
+
+    new_points = np.array(new_points, dtype=np.float32)
+    status = np.array(status, dtype=np.uint8)
+
+    return new_points, status
+
+
+def build_pyramid(image, max_level=2):
+    """
+    Build image pyramid from scratch — no cv.pyrDown
+    """
+    # Gaussian kernel for blurring before downsampling
+    kernel = np.array([[1, 4, 6, 4, 1],
+                       [4, 16, 24, 16, 4],
+                       [6, 24, 36, 24, 6],
+                       [4, 16, 24, 16, 4],
+                       [1, 4, 6, 4, 1]], dtype=np.float32) / 256.0
+
+    pyramid = [image.astype(np.float32)]
+
+    for i in range(max_level):
+        current = pyramid[-1]
+
+        # Step 1 — Gaussian blur using filter2D
+        blurred = cv.filter2D(current, -1, kernel)
+
+        # Step 2 — Subsample: take every other row and column
+        downsampled = blurred[::2, ::2]
+
+        pyramid.append(downsampled)
+
+    return pyramid  
+
+def pyramidal_lk(frame1, frame2, points, win_size=15, max_level=2):
+    """
+    Pyramidal Lucas-Kanade optical flow from scratch.
+
+    frame1, frame2 : grayscale images
+    points         : array of shape (N, 1, 2)
+    win_size       : patch size for LK
+    max_level      : number of pyramid levels
+
+    Returns:
+    new_points : array of shape (N, 1, 2)
+    status     : array of shape (N,) — 1 tracked, 0 lost
+    """
+    # Step 1 — build pyramids for both frames
+    pyramid1 = build_pyramid(frame1, max_level)
+    pyramid2 = build_pyramid(frame2, max_level)
+
+    # Step 2 — scale points down to coarsest level
+    scale = 2 ** max_level  # = 4 for max_level=2
+    current_points = points.copy() / scale
+
+    # Step 3 — start from coarsest, work down to finest
+    for level in range(max_level, -1, -1):  # [2, 1, 0]
+
+        # Get frames at this pyramid level
+        f1 = pyramid1[level].astype(np.float32)
+        f2 = pyramid2[level].astype(np.float32)
+
+        # Run plain LK at this level
+        new_points, status = track_points(f1, f2, current_points, win_size)
+
+        # Step 4 — if not at finest level, scale points UP for next level
+        if level > 0:
+            # Scale up: multiply by 2 to go from coarse to fine
+            new_points = new_points * 2
+            current_points = new_points
+        else:
+            # At finest level — these are our final results
+            current_points = new_points
+
+    return current_points, status
+
+
+# ── MAIN LOOP ─────────────────────────────────────────
+if __name__ == "__main__":
+    # Video capture - walking scene (15s to 20s)
+    cap = cv.VideoCapture('D:/agvtask/OPTICAL_FLOW.mp4')
+
+    START_FRAME = 900   # 15 seconds × 60 fps
+    END_FRAME = 1200  # 20 seconds × 60 fps
+    cap.set(cv.CAP_PROP_POS_FRAMES, START_FRAME)
+
+    # Shi-Tomasi params
+    feature_params = dict(maxCorners=100,
+                          qualityLevel=0.1,
+                          minDistance=7,
+                          blockSize=7)
+
+    # Random colours
+    color = np.random.randint(0, 255, (100, 3))
+
+    # Read and resize first frame
+    ret, old_frame = cap.read()
+    old_frame = cv.resize(old_frame, (960, 540))
+    old_gray = cv.cvtColor(old_frame, cv.COLOR_BGR2GRAY)
+
+    # Detect initial corners using Shi-Tomasi
+    p0 = cv.goodFeaturesToTrack(old_gray, mask=None, **feature_params)
+
+    # Blank canvas for trails
+    mask = np.zeros_like(old_frame)
+
+    frame_count = 0
+
+    # Make window resizable
+    cv.namedWindow('Pyramidal LK - Scratch', cv.WINDOW_NORMAL)
+    cv.resizeWindow('Pyramidal LK - Scratch', 960, 540)
+
+    while True:
+        ret, frame = cap.read()
+
+        # Stop if video ends or past end frame
+        if not ret or (START_FRAME + frame_count) > END_FRAME:
+            print('Done!')
+            break
+
+        frame = cv.resize(frame, (960, 540))
+        frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+
+        # ── KEY DIFFERENCE ──────────────────────────────
+        # Using OUR pyramidal LK instead of cv.calcOpticalFlowPyrLK
+        p1, status = pyramidal_lk(old_gray, frame_gray, p0,
+                                  win_size=15, max_level=2)
+        # ────────────────────────────────────────────────
+
+        # Filter successfully tracked points
+        good_new = p1[status == 1]
+        good_old = p0[status == 1]
+
+        # Draw trails and dots
+        for i, (new, old) in enumerate(zip(good_new, good_old)):
+            a, b = new.ravel()
+            c, d = old.ravel()
+
+            # Skip barely moving points
+            distance = np.sqrt((a - c)**2 + (b - d)**2)
+            if distance < 0.5:
+                continue
+
+            mask = cv.line(mask,
+                           (int(a), int(b)), (int(c), int(d)),
+                           color[i % 100].tolist(), 2)
+            frame = cv.circle(frame,
+                              (int(a), int(b)), 5,
+                              color[i % 100].tolist(), -1)
+
+        # Overlay trails on frame
+        img = cv.add(frame, mask)
+
+        # Show point count and level info
+        cv.putText(img, f'Tracking: {len(good_new)} points | Pyramid levels: 2',
+                   (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv.putText(img, 'Custom LK implementation',
+                   (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        cv.imshow('Pyramidal LK - Scratch', img)
+
+        # Refresh every 30 frames
+        frame_count += 1
+        if len(good_new) < 10:  # only refresh when points die out
+            p0 = cv.goodFeaturesToTrack(old_gray, mask=None, **feature_params)
+            mask = np.zeros_like(old_frame)
+            color = np.random.randint(0, 255, (100, 3))
+        elif frame_count % 60 == 0:  # periodic refresh every 60 frames
+            new_pts = cv.goodFeaturesToTrack(
+                old_gray, mask=None, **feature_params)
+            if new_pts is not None:
+                p0 = np.concatenate(
+                    [good_new.reshape(-1, 1, 2), new_pts], axis=0)
+                p0 = p0[:50]  # keep max 50 points
+            else:
+                p0 = good_new.reshape(-1, 1, 2)
+        else:
+            p0 = good_new.reshape(-1, 1, 2)
+        old_gray = frame_gray.copy()
+
+        if cv.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv.destroyAllWindows()
